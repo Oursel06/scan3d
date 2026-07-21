@@ -16,9 +16,6 @@
     #hud b { color: #33ccff; }
     #dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; background: #e05a5a; vertical-align: middle; }
     #dot.on { background: #4ad06a; }
-    #help { position: fixed; bottom: 10px; left: 12px; z-index: 10;
-      color: #8a8a90; font: 12px/1.4 ui-monospace, Menlo, Consolas, monospace;
-      pointer-events: none; user-select: none; }
   </style>
 
   <!-- Client Socket.io servi automatiquement par le serveur (version alignee) -->
@@ -39,7 +36,6 @@
   <div id="hud">
     <span id="dot"></span> <span id="state">Connexion…</span> &nbsp;|&nbsp; Points : <b id="count">0</b>
   </div>
-  <div id="help">R : recadrer &nbsp;·&nbsp; C : effacer &nbsp;·&nbsp; souris : orbite / zoom</div>
 
   <script type="module">
     import * as THREE from 'three';
@@ -77,38 +73,54 @@
     const posAttr = new THREE.BufferAttribute(positions, 3);
     posAttr.setUsage(THREE.DynamicDrawUsage); // buffer mis a jour souvent
 
+    const colors = new Float32Array(MAX_POINTS * 3); // couleur RGB par point (0..1)
+    const colAttr = new THREE.BufferAttribute(colors, 3);
+    colAttr.setUsage(THREE.DynamicDrawUsage);
+
     const geometry = new THREE.BufferGeometry();
     geometry.setAttribute('position', posAttr);
+    geometry.setAttribute('color', colAttr);
     geometry.setDrawRange(0, 0); // on ne dessine que les points recus
 
-    // Taille en PIXELS (sizeAttenuation: false) : les points restent visibles
-    // quelle que soit l'echelle reelle du nuage recu.
-    const material = new THREE.PointsMaterial({ size: 3, color: 0x33ccff, sizeAttenuation: false });
+    // Couleur reelle par point (vertexColors) ; taille en metres avec attenuation
+    // perspective pour un rendu plus realiste (points proches plus gros).
+    let pointSize = 0.012; // ~1,2 cm
+    const material = new THREE.PointsMaterial({
+      size: pointSize, vertexColors: true, sizeAttenuation: true
+    });
     const cloud = new THREE.Points(geometry, material);
     scene.add(cloud);
+
+    const DEFAULT_COLOR = [0.20, 0.80, 1.0]; // cyan de repli si aucune couleur transmise
 
     let count = 0;           // nombre de points actuellement affiches
     let fitted = false;      // recadrage auto effectue au premier nuage ?
     const countEl = document.getElementById('count');
 
-    // Normalise l'entree en tableau plat [x,y,z, ...] en ne gardant que des nombres finis.
-    function toFlat(data) {
+    // Parse l'entree en { pos:[x,y,z,...], col:[r,g,b,...] } (couleurs normalisees 0..1).
+    // Accepte [x,y,z] ou [x,y,z,r,g,b] (r,g,b en 0..255) et {x,y,z,r,g,b}.
+    function parsePoints(data) {
       if (!data) return null;
       if (data.points) data = data.points;       // { points: [...] }
       if (!Array.isArray(data)) return null;
-      const flat = [];
-      const push = (x, y, z) => {
-        if (Number.isFinite(x) && Number.isFinite(y) && Number.isFinite(z)) flat.push(x, y, z);
+      const pos = [], col = [];
+      const push = (x, y, z, r, g, b) => {
+        if (!(Number.isFinite(x) && Number.isFinite(y) && Number.isFinite(z))) return;
+        pos.push(x, y, z);
+        if (Number.isFinite(r) && Number.isFinite(g) && Number.isFinite(b))
+          col.push(r / 255, g / 255, b / 255);
+        else
+          col.push(DEFAULT_COLOR[0], DEFAULT_COLOR[1], DEFAULT_COLOR[2]);
       };
       if (typeof data[0] === 'number') {          // deja plat [x,y,z,...]
         for (let i = 0; i + 2 < data.length; i += 3) push(data[i], data[i + 1], data[i + 2]);
-        return flat;
+        return { pos, col };
       }
       for (const p of data) {
-        if (Array.isArray(p)) push(p[0], p[1], p[2]);
-        else if (p && typeof p === 'object') push(p.x, p.y, p.z);
+        if (Array.isArray(p)) push(p[0], p[1], p[2], p[3], p[4], p[5]);
+        else if (p && typeof p === 'object') push(p.x, p.y, p.z, p.r, p.g, p.b);
       }
-      return flat;
+      return { pos, col };
     }
 
     // Recadre la camera sur l'ensemble du nuage courant.
@@ -133,23 +145,26 @@
       fitted = false;
       geometry.setDrawRange(0, 0);
       posAttr.needsUpdate = true;
+      colAttr.needsUpdate = true;
       countEl.textContent = 0;
     }
 
-    // Reception temps reel -> ajout des points a la geometrie
+    // Reception temps reel -> ajout des points (+ couleurs) a la geometrie
     socket.on('draw_points', (data) => {
-      const flat = toFlat(data);
-      if (!flat) return;
-      let n = Math.floor(flat.length / 3);
+      const parsed = parsePoints(data);
+      if (!parsed) return;
+      let n = Math.floor(parsed.pos.length / 3);
       if (!n) return;
 
       if (count + n > MAX_POINTS) { count = 0; fitted = false; } // buffer plein -> on repart de zero
       n = Math.min(n, MAX_POINTS - count);
 
-      positions.set(flat.slice(0, n * 3), count * 3);
+      positions.set(parsed.pos.slice(0, n * 3), count * 3);
+      colors.set(parsed.col.slice(0, n * 3), count * 3);
       count += n;
 
-      posAttr.needsUpdate = true;                 // renvoi du buffer au GPU
+      posAttr.needsUpdate = true;                 // renvoi des buffers au GPU
+      colAttr.needsUpdate = true;
       geometry.setDrawRange(0, count);
       countEl.textContent = count;
 
@@ -157,11 +172,13 @@
       if (!fitted) { fitToCloud(); fitted = true; }
     });
 
-    // Raccourcis : R = recadrer, C = effacer
+    // Raccourcis : R = recadrer, C = effacer, +/- = taille des points
     addEventListener('keydown', (e) => {
       const k = e.key.toLowerCase();
       if (k === 'r') fitToCloud();
       else if (k === 'c') clearCloud();
+      else if (k === '+' || k === '=') { pointSize = Math.min(pointSize * 1.25, 1); material.size = pointSize; }
+      else if (k === '-') { pointSize = Math.max(pointSize / 1.25, 0.001); material.size = pointSize; }
     });
 
     // ---- Etat de connexion (HUD) ---------------------------------------
