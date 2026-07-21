@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <title>Nuage de Points 3D — Temps Reel</title>
+  <style>
+    html, body { margin: 0; height: 100%; overflow: hidden; background: #101014; }
+    #app { position: fixed; inset: 0; }
+    #hud {
+      position: fixed; top: 10px; left: 12px; z-index: 10;
+      color: #e6e6e6; font: 13px/1.5 ui-monospace, Menlo, Consolas, monospace;
+      background: rgba(0,0,0,.35); padding: 8px 12px; border-radius: 8px;
+      pointer-events: none; user-select: none;
+    }
+    #hud b { color: #33ccff; }
+    #dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; background: #e05a5a; vertical-align: middle; }
+    #dot.on { background: #4ad06a; }
+  </style>
+
+  <!-- Client Socket.io servi automatiquement par le serveur (version alignee) -->
+  <script src="/socket.io/socket.io.js"></script>
+
+  <!-- Three.js via CDN (ES modules + importmap) -->
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+      "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+    }
+  }
+  </script>
+</head>
+<body>
+  <div id="app"></div>
+  <div id="hud">
+    <span id="dot"></span> <span id="state">Connexion…</span> &nbsp;|&nbsp; Points : <b id="count">0</b>
+  </div>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+    // Connexion auto (compatible HTTP et HTTPS/WSS grace au chemin relatif)
+    const socket = io();
+
+    const MAX_POINTS = 500000; // capacite du buffer pre-alloue
+
+    // ---- Scene / Camera / Renderer -------------------------------------
+    const container = document.getElementById('app');
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x101014);
+
+    const camera = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 0.1, 100000);
+    camera.position.set(0, 0, 80);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
+    renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+    renderer.setSize(innerWidth, innerHeight);
+    container.appendChild(renderer.domElement);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+
+    scene.add(new THREE.AxesHelper(10));
+
+    // ---- Geometrie de points pre-allouee (optimisee) ------------------
+    const positions = new Float32Array(MAX_POINTS * 3);
+    const posAttr = new THREE.BufferAttribute(positions, 3);
+    posAttr.setUsage(THREE.DynamicDrawUsage); // buffer mis a jour souvent
+
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute('position', posAttr);
+    geometry.setDrawRange(0, 0); // on ne dessine que les points recus
+
+    const material = new THREE.PointsMaterial({ size: 0.6, color: 0x33ccff, sizeAttenuation: true });
+    const cloud = new THREE.Points(geometry, material);
+    scene.add(cloud);
+
+    let count = 0; // nombre de points actuellement affiches
+    const countEl = document.getElementById('count');
+
+    // Normalise l'entree en tableau plat [x,y,z, x,y,z, ...]
+    function toFlat(data) {
+      if (!data) return null;
+      if (data.points) data = data.points;       // { points: [...] }
+      if (!Array.isArray(data)) return null;
+      if (typeof data[0] === 'number') return data; // deja plat
+      const flat = [];
+      for (const p of data) {
+        if (Array.isArray(p)) flat.push(p[0], p[1], p[2]);
+        else if (p && typeof p === 'object') flat.push(p.x, p.y, p.z);
+      }
+      return flat;
+    }
+
+    // Reception temps reel -> ajout des points a la geometrie
+    socket.on('draw_points', (data) => {
+      const flat = toFlat(data);
+      if (!flat) return;
+      let n = Math.floor(flat.length / 3);
+      if (!n) return;
+
+      if (count + n > MAX_POINTS) count = 0;      // buffer plein -> on repart de zero
+      n = Math.min(n, MAX_POINTS - count);
+
+      positions.set(flat.slice(0, n * 3), count * 3);
+      count += n;
+
+      posAttr.needsUpdate = true;                 // renvoi du buffer au GPU
+      geometry.setDrawRange(0, count);
+      geometry.computeBoundingSphere();
+      countEl.textContent = count;
+    });
+
+    // ---- Etat de connexion (HUD) ---------------------------------------
+    const dot = document.getElementById('dot');
+    const stateEl = document.getElementById('state');
+    socket.on('connect',    () => { dot.classList.add('on');    stateEl.textContent = 'Connecte'; });
+    socket.on('disconnect', () => { dot.classList.remove('on'); stateEl.textContent = 'Deconnecte'; });
+
+    // ---- Boucle de rendu & resize --------------------------------------
+    addEventListener('resize', () => {
+      camera.aspect = innerWidth / innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(innerWidth, innerHeight);
+    });
+
+    renderer.setAnimationLoop(() => {
+      controls.update();
+      renderer.render(scene, camera);
+    });
+  </script>
+</body>
+</html>
