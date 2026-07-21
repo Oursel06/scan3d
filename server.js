@@ -7,10 +7,16 @@ const auth = require('./auth');
 const app = express();
 const server = http.createServer(app);
 
+// Taille max d'un lot de points. Le defaut socket.io est de 1 Mo seulement, soit
+// ~16 000 points : au-dela le serveur FERME la connexion sans message d'erreur,
+// et le client boucle en reconnexion. 400 000 points ~= 26 Mo.
+const MAX_BATCH_MB = Number(process.env.SCAN3D_MAX_BATCH_MB || 32);
+
 // CORS restreint aux origines de SCAN3D_ORIGINS. Sans effet sur l'app Android :
 // un client natif n'envoie pas d'en-tete Origin.
 const io = new Server(server, {
-  cors: { origin: auth.corsOrigin }
+  cors: { origin: auth.corsOrigin },
+  maxHttpBufferSize: MAX_BATCH_MB * 1024 * 1024,
 });
 
 const PORT = process.env.PORT || 3000;
@@ -36,11 +42,16 @@ io.on('connection', (socket) => {
   // Le 2e argument (ack) est un callback d'accuse de reception : on l'appelle une fois
   // le lot rediffuse, ce qui permet a l'app Android de marquer ces points comme "envoyes" (verts).
   socket.on('new_points', (data, ack) => {
+    const n = Array.isArray(data) ? data.length : 0;
     socket.broadcast.emit('draw_points', data);
-    if (typeof ack === 'function') ack({ ok: true });
+    if (typeof ack === 'function') ack({ ok: true, count: n });
+    console.log(`  lot recu de ${socket.id} : ${n} points`);
   });
 
-  socket.on('disconnect', () => console.log('Client deconnecte :', socket.id));
+  // La raison est indispensable au diagnostic : un lot trop gros produit
+  // "transport close" cote serveur, sans autre trace.
+  socket.on('disconnect', (reason) =>
+    console.log('Client deconnecte :', socket.id, '- raison:', reason));
 });
 
 server.listen(PORT, HOST, () => {
