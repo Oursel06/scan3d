@@ -33,6 +33,18 @@ app.use(auth.httpGuard);
 // qui exposerait package.json, node_modules et le .env.local symlinke par le deploiement.
 app.get('/', (_req, res) => res.sendFile(path.join(__dirname, 'index.html')));
 
+// Telechargement de l'app Android depuis le telephone, sans cable ni adb.
+// Le fichier vit dans shared/ : il survit aux deploiements et n'entre pas dans git.
+// Protege par le meme token que la page (le gate est applique juste au-dessus).
+app.get('/apk', (_req, res) => {
+  const apk = process.env.SCAN3D_APK || '/home/jordi/scan3d/shared/scan3d.apk';
+  res.type('application/vnd.android.package-archive');
+  res.setHeader('Content-Disposition', 'attachment; filename="scan3d.apk"');
+  res.sendFile(apk, (err) => {
+    if (err && !res.headersSent) res.status(404).type('text/plain').send('APK absent');
+  });
+});
+
 io.use(auth.socketGuard);
 
 io.on('connection', (socket) => {
