@@ -5,12 +5,12 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
   <title>Reconstruction 3D — Blocs Temps Reel</title>
   <style>
-    html, body { margin: 0; height: 100%; overflow: hidden; background: #101014; }
+    html, body { margin: 0; height: 100%; overflow: hidden; background: #0d0d10; }
     #app { position: fixed; inset: 0; }
     #hud {
       position: fixed; top: 10px; left: 12px; z-index: 10;
       color: #e6e6e6; font: 13px/1.5 ui-monospace, Menlo, Consolas, monospace;
-      background: rgba(0,0,0,.35); padding: 8px 12px; border-radius: 8px;
+      background: rgba(0,0,0,.4); padding: 8px 12px; border-radius: 8px;
       pointer-events: none; user-select: none;
     }
     #hud b { color: #33ccff; }
@@ -18,10 +18,7 @@
     #dot.on { background: #4ad06a; }
   </style>
 
-  <!-- Client Socket.io servi automatiquement par le serveur (version alignee) -->
   <script src="/socket.io/socket.io.js"></script>
-
-  <!-- Three.js via CDN (ES modules + importmap) -->
   <script type="importmap">
   {
     "imports": {
@@ -41,17 +38,17 @@
     import * as THREE from 'three';
     import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 
-    // Connexion auto (compatible HTTP et HTTPS/WSS grace au chemin relatif)
     const socket = io();
 
-    const VOXEL = 0.05;          // taille d'un bloc : 5 cm
+    // Taille de bloc : 5 cm par défaut, ajustable via ?voxel=0.03 (3 cm) dans l'URL.
+    const VOXEL = parseFloat(new URLSearchParams(location.search).get('voxel')) || 0.05;
     const INV_VOXEL = 1 / VOXEL;
-    let capacity = 200000;       // capacite initiale de l'InstancedMesh (blocs)
+    let capacity = 300000;
 
     // ---- Scene / Camera / Renderer -------------------------------------
     const container = document.getElementById('app');
     const scene = new THREE.Scene();
-    scene.background = new THREE.Color(0x101014);
+    scene.background = new THREE.Color(0x0d0d10);
 
     const camera = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 0.01, 1000);
     camera.position.set(3, 2.5, 4);
@@ -64,23 +61,17 @@
     const controls = new OrbitControls(camera, renderer.domElement);
     controls.enableDamping = true;
 
-    // Eclairage : ambiant + directionnel -> les faces des cubes s'ombrent
-    // differemment (aspect volumetrique facon Minecraft).
-    scene.add(new THREE.AmbientLight(0xffffff, 0.75));
-    const dir = new THREE.DirectionalLight(0xffffff, 0.9);
-    dir.position.set(1, 2, 1.5);
-    scene.add(dir);
-    const dir2 = new THREE.DirectionalLight(0xffffff, 0.35);
-    dir2.position.set(-1, -0.5, -1);
-    scene.add(dir2);
+    // Eclairage doux (ciel/sol) + directionnels : volume et lisibilité des faces.
+    scene.add(new THREE.HemisphereLight(0xffffff, 0x404050, 0.9));
+    const d1 = new THREE.DirectionalLight(0xffffff, 0.8); d1.position.set(1, 2, 1.5); scene.add(d1);
+    const d2 = new THREE.DirectionalLight(0xffffff, 0.3); d2.position.set(-1, -0.5, -1); scene.add(d2);
 
     scene.add(new THREE.AxesHelper(0.5));
-    const grid = new THREE.GridHelper(12, 24, 0x444455, 0x24242c);
-    scene.add(grid);
+    scene.add(new THREE.GridHelper(12, 24, 0x444455, 0x1e1e26));
 
     // ---- Grille de voxels (InstancedMesh de cubes) ---------------------
     const boxGeom = new THREE.BoxGeometry(VOXEL, VOXEL, VOXEL);
-    const boxMat = new THREE.MeshLambertMaterial({ vertexColors: false });
+    const boxMat = new THREE.MeshLambertMaterial();
 
     let mesh = new THREE.InstancedMesh(boxGeom, boxMat, capacity);
     mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
@@ -88,105 +79,110 @@
     mesh.frustumCulled = false;
     scene.add(mesh);
 
-    // Etat des voxels : cle "ix,iy,iz" -> index d'instance
-    const voxelIndex = new Map();
-    // Accumulateurs de couleur par voxel (moyenne des couleurs des points tombes dedans)
-    let sumR = new Float32Array(capacity);
+    const voxelIndex = new Map();           // "ix,iy,iz" -> index d'instance
+    let vIx = new Int32Array(capacity);     // coords voxel (pour reconstruire la matrice)
+    let vIy = new Int32Array(capacity);
+    let vIz = new Int32Array(capacity);
+    let sumR = new Float32Array(capacity);  // accumulateurs couleur
     let sumG = new Float32Array(capacity);
     let sumB = new Float32Array(capacity);
     let cnt  = new Uint32Array(capacity);
+    let neigh = new Uint8Array(capacity);   // nb de voisins (6-voisinage) -> AO + masquage interne
     let occupied = 0;
 
     const bboxMin = new THREE.Vector3(Infinity, Infinity, Infinity);
     const bboxMax = new THREE.Vector3(-Infinity, -Infinity, -Infinity);
     let fitted = false;
+    let matrixDirty = false, colorDirty = false;
 
     const dummy = new THREE.Object3D();
     const tmpColor = new THREE.Color();
     const countEl = document.getElementById('count');
 
-    function growCapacity() {
-      const newCap = capacity * 2;
-      const newMesh = new THREE.InstancedMesh(boxGeom, boxMat, newCap);
-      newMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
-      newMesh.count = occupied;
-      newMesh.frustumCulled = false;
-      // Recopie des matrices et couleurs existantes
-      for (let i = 0; i < occupied; i++) {
-        mesh.getMatrixAt(i, dummy.matrix);
-        newMesh.setMatrixAt(i, dummy.matrix);
-      }
-      if (mesh.instanceColor) {
-        newMesh.instanceColor = new THREE.InstancedBufferAttribute(new Float32Array(newCap * 3), 3);
-        newMesh.instanceColor.array.set(mesh.instanceColor.array.subarray(0, occupied * 3));
-      }
-      scene.remove(mesh);
-      mesh.dispose();
-      mesh = newMesh;
-      scene.add(mesh);
+    const NB = [[1,0,0],[-1,0,0],[0,1,0],[0,-1,0],[0,0,1],[0,0,-1]];
 
-      const nR = new Float32Array(newCap); nR.set(sumR); sumR = nR;
-      const nG = new Float32Array(newCap); nG.set(sumG); sumG = nG;
-      const nB = new Float32Array(newCap); nB.set(sumB); sumB = nB;
-      const nC = new Uint32Array(newCap);  nC.set(cnt);  cnt  = nC;
-      capacity = newCap;
+    function growCapacity() {
+      const nc = capacity * 2;
+      const nm = new THREE.InstancedMesh(boxGeom, boxMat, nc);
+      nm.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+      nm.count = occupied; nm.frustumCulled = false;
+      for (let i = 0; i < occupied; i++) { mesh.getMatrixAt(i, dummy.matrix); nm.setMatrixAt(i, dummy.matrix); }
+      nm.instanceColor = new THREE.InstancedBufferAttribute(new Float32Array(nc * 3), 3);
+      if (mesh.instanceColor) nm.instanceColor.array.set(mesh.instanceColor.array.subarray(0, occupied * 3));
+      scene.remove(mesh); mesh.dispose(); mesh = nm; scene.add(mesh);
+      const gi32 = a => { const n = new Int32Array(nc); n.set(a); return n; };
+      const gf32 = a => { const n = new Float32Array(nc); n.set(a); return n; };
+      vIx = gi32(vIx); vIy = gi32(vIy); vIz = gi32(vIz);
+      sumR = gf32(sumR); sumG = gf32(sumG); sumB = gf32(sumB);
+      const ncnt = new Uint32Array(nc); ncnt.set(cnt); cnt = ncnt;
+      const nne = new Uint8Array(nc); nne.set(neigh); neigh = nne;
+      capacity = nc;
     }
 
-    // Ajoute un point (x,y,z en metres, r,g,b en 0..255) a la grille de voxels.
+    // Recalcule couleur (moyenne × AO) et visibilité (masquage si 6 voisins) d'un voxel.
+    function updateAppearance(idx) {
+      const visible = neigh[idx] < 6;
+      dummy.position.set((vIx[idx] + 0.5) * VOXEL, (vIy[idx] + 0.5) * VOXEL, (vIz[idx] + 0.5) * VOXEL);
+      dummy.rotation.set(0, 0, 0);
+      dummy.scale.setScalar(visible ? 1 : 0.0001); // interne -> dégénéré (invisible)
+      dummy.updateMatrix();
+      mesh.setMatrixAt(idx, dummy.matrix);
+      const c = cnt[idx];
+      const ao = 1 - 0.55 * (neigh[idx] / 6); // creux (bcp de voisins) -> plus sombre
+      tmpColor.setRGB(
+        Math.min(sumR[idx] / c / 255 * ao, 1),
+        Math.min(sumG[idx] / c / 255 * ao, 1),
+        Math.min(sumB[idx] / c / 255 * ao, 1)
+      );
+      mesh.setColorAt(idx, tmpColor);
+      matrixDirty = true; colorDirty = true;
+    }
+
     function addPoint(x, y, z, r, g, b) {
       if (!(Number.isFinite(x) && Number.isFinite(y) && Number.isFinite(z))) return;
-      const ix = Math.floor(x * INV_VOXEL);
-      const iy = Math.floor(y * INV_VOXEL);
-      const iz = Math.floor(z * INV_VOXEL);
+      const ix = Math.floor(x * INV_VOXEL), iy = Math.floor(y * INV_VOXEL), iz = Math.floor(z * INV_VOXEL);
       const key = ix + ',' + iy + ',' + iz;
-
       let idx = voxelIndex.get(key);
       if (idx === undefined) {
         if (occupied >= capacity) growCapacity();
         idx = occupied++;
         voxelIndex.set(key, idx);
-        // Position du bloc = centre de la cellule
-        dummy.position.set((ix + 0.5) * VOXEL, (iy + 0.5) * VOXEL, (iz + 0.5) * VOXEL);
-        dummy.rotation.set(0, 0, 0);
-        dummy.updateMatrix();
-        mesh.setMatrixAt(idx, dummy.matrix);
+        vIx[idx] = ix; vIy[idx] = iy; vIz[idx] = iz;
+        sumR[idx] = r; sumG[idx] = g; sumB[idx] = b; cnt[idx] = 1; neigh[idx] = 0;
         mesh.count = occupied;
-        mesh.instanceMatrix.needsUpdate = true;
-
+        // Voisinage : met à jour les compteurs et l'apparence des voisins existants.
+        for (let k = 0; k < 6; k++) {
+          const nk = (ix + NB[k][0]) + ',' + (iy + NB[k][1]) + ',' + (iz + NB[k][2]);
+          const nj = voxelIndex.get(nk);
+          if (nj !== undefined) { neigh[idx]++; neigh[nj]++; updateAppearance(nj); }
+        }
+        updateAppearance(idx);
         const cx = (ix + 0.5) * VOXEL, cy = (iy + 0.5) * VOXEL, cz = (iz + 0.5) * VOXEL;
         if (cx < bboxMin.x) bboxMin.x = cx; if (cx > bboxMax.x) bboxMax.x = cx;
         if (cy < bboxMin.y) bboxMin.y = cy; if (cy > bboxMax.y) bboxMax.y = cy;
         if (cz < bboxMin.z) bboxMin.z = cz; if (cz > bboxMax.z) bboxMax.z = cz;
+      } else {
+        sumR[idx] += r; sumG[idx] += g; sumB[idx] += b; cnt[idx] += 1;
+        updateAppearance(idx);
       }
-      // Moyenne cumulative de la couleur
-      sumR[idx] += r; sumG[idx] += g; sumB[idx] += b; cnt[idx] += 1;
-      const c = cnt[idx];
-      tmpColor.setRGB(sumR[idx] / c / 255, sumG[idx] / c / 255, sumB[idx] / c / 255);
-      mesh.setColorAt(idx, tmpColor);
-      mesh.instanceColor.needsUpdate = true;
     }
 
-    // ---- Decodage des lots recus ---------------------------------------
-    // Format binaire : [uint32 N][N x 3 float32 xyz][N x 3 uint8 rgb], little-endian.
+    // ---- Décodage des lots (binaire : [uint32 N][float32 xyz][uint8 rgb]) ----
     function addBinary(buf) {
       const dv = new DataView(buf);
       if (dv.byteLength < 4) return;
       const n = dv.getUint32(0, true);
-      const posOff = 4;
-      const colOff = 4 + 12 * n;
-      if (dv.byteLength < colOff + 3 * n) return; // lot tronque
+      const posOff = 4, colOff = 4 + 12 * n;
+      if (dv.byteLength < colOff + 3 * n) return;
       for (let i = 0; i < n; i++) {
-        const x = dv.getFloat32(posOff + i * 12, true);
-        const y = dv.getFloat32(posOff + i * 12 + 4, true);
-        const z = dv.getFloat32(posOff + i * 12 + 8, true);
-        const r = dv.getUint8(colOff + i * 3);
-        const g = dv.getUint8(colOff + i * 3 + 1);
-        const b = dv.getUint8(colOff + i * 3 + 2);
-        addPoint(x, y, z, r, g, b);
+        addPoint(
+          dv.getFloat32(posOff + i * 12, true),
+          dv.getFloat32(posOff + i * 12 + 4, true),
+          dv.getFloat32(posOff + i * 12 + 8, true),
+          dv.getUint8(colOff + i * 3), dv.getUint8(colOff + i * 3 + 1), dv.getUint8(colOff + i * 3 + 2)
+        );
       }
     }
-
-    // Repli : ancien format JSON ([x,y,z] ou [x,y,z,r,g,b] ou {x,y,z,...}).
     function addJson(data) {
       if (data && data.points) data = data.points;
       if (!Array.isArray(data)) return;
@@ -204,54 +200,43 @@
       if (data instanceof ArrayBuffer) addBinary(data);
       else if (ArrayBuffer.isView(data)) addBinary(data.buffer);
       else addJson(data);
-
       countEl.textContent = occupied;
       if (!fitted && occupied > 0) { fitToScene(); fitted = true; }
     });
 
-    // ---- Recadrage camera sur la reconstruction ------------------------
+    // ---- Recadrage / effacement ----------------------------------------
     function fitToScene() {
       if (occupied === 0 || !Number.isFinite(bboxMin.x)) return;
       const center = new THREE.Vector3().addVectors(bboxMin, bboxMax).multiplyScalar(0.5);
-      const size = new THREE.Vector3().subVectors(bboxMax, bboxMin);
-      const radius = Math.max(size.length() * 0.5, VOXEL * 4);
+      const radius = Math.max(new THREE.Vector3().subVectors(bboxMax, bboxMin).length() * 0.5, VOXEL * 4);
       const dist = (radius / Math.sin(THREE.MathUtils.degToRad(camera.fov * 0.5))) * 1.25;
-      const d = new THREE.Vector3(1, 0.6, 1).normalize();
+      const dir = new THREE.Vector3(1, 0.6, 1).normalize();
       controls.target.copy(center);
-      camera.position.copy(center).addScaledVector(d, dist);
+      camera.position.copy(center).addScaledVector(dir, dist);
       camera.near = Math.max(dist / 1000, 0.001);
       camera.far = dist * 100 + radius * 10;
       camera.updateProjectionMatrix();
       controls.update();
     }
-
     function clearScene() {
-      voxelIndex.clear();
-      occupied = 0;
-      mesh.count = 0;
+      voxelIndex.clear(); occupied = 0; mesh.count = 0;
       mesh.instanceMatrix.needsUpdate = true;
       if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
-      sumR.fill(0); sumG.fill(0); sumB.fill(0); cnt.fill(0);
-      bboxMin.set(Infinity, Infinity, Infinity);
-      bboxMax.set(-Infinity, -Infinity, -Infinity);
-      fitted = false;
-      countEl.textContent = 0;
+      neigh.fill(0); cnt.fill(0);
+      bboxMin.set(Infinity, Infinity, Infinity); bboxMax.set(-Infinity, -Infinity, -Infinity);
+      fitted = false; countEl.textContent = 0;
     }
-
-    // Raccourcis : R = recadrer, C = effacer
     addEventListener('keydown', (e) => {
       const k = e.key.toLowerCase();
       if (k === 'r') fitToScene();
       else if (k === 'c') clearScene();
     });
 
-    // ---- Etat de connexion (HUD) ---------------------------------------
-    const dot = document.getElementById('dot');
-    const stateEl = document.getElementById('state');
+    // ---- Connexion (HUD) -----------------------------------------------
+    const dot = document.getElementById('dot'), stateEl = document.getElementById('state');
     socket.on('connect',    () => { dot.classList.add('on');    stateEl.textContent = 'Connecte'; });
     socket.on('disconnect', () => { dot.classList.remove('on'); stateEl.textContent = 'Deconnecte'; });
 
-    // ---- Boucle de rendu & resize --------------------------------------
     addEventListener('resize', () => {
       camera.aspect = innerWidth / innerHeight;
       camera.updateProjectionMatrix();
@@ -259,6 +244,8 @@
     });
 
     renderer.setAnimationLoop(() => {
+      if (matrixDirty) { mesh.instanceMatrix.needsUpdate = true; matrixDirty = false; }
+      if (colorDirty && mesh.instanceColor) { mesh.instanceColor.needsUpdate = true; colorDirty = false; }
       controls.update();
       renderer.render(scene, camera);
     });
