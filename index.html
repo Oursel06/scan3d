@@ -38,7 +38,13 @@
     import * as THREE from 'three';
     import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 
-    const socket = io();
+    // Token d'acces : ?k=... dans l'URL, sinon le cookie pose par le serveur
+    // au premier chargement (permet un F5 sans remettre ?k=).
+    const TOKEN = new URLSearchParams(location.search).get('k')
+      || decodeURIComponent((document.cookie.match(/(?:^|;\s*)scan3d_k=([^;]*)/) || [])[1] || '');
+    // WebSocket d'abord (polling garde en repli) : en acces depuis le LAN via le
+    // domaine public, le hairpin de la box degrade le long-polling, pas le WebSocket.
+    const socket = io({ auth: { token: TOKEN }, transports: ['websocket', 'polling'] });
 
     // Taille de bloc : 5 cm par défaut, ajustable via ?voxel=0.03 (3 cm) dans l'URL.
     const VOXEL = parseFloat(new URLSearchParams(location.search).get('voxel')) || 0.05;
@@ -236,6 +242,10 @@
     const dot = document.getElementById('dot'), stateEl = document.getElementById('state');
     socket.on('connect',    () => { dot.classList.add('on');    stateEl.textContent = 'Connecte'; });
     socket.on('disconnect', () => { dot.classList.remove('on'); stateEl.textContent = 'Deconnecte'; });
+    socket.on('connect_error', (e) => {
+      dot.classList.remove('on');
+      stateEl.textContent = (e.message === 'unauthorized') ? 'Token refuse' : 'Erreur : ' + e.message;
+    });
 
     addEventListener('resize', () => {
       camera.aspect = innerWidth / innerHeight;

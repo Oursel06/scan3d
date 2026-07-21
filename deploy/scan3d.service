@@ -1,0 +1,18 @@
+[Unit]
+Description=scan3d.cube3d.fr — relais 3D temps reel (Express + socket.io)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=jordi
+WorkingDirectory=/home/jordi/scan3d/current
+EnvironmentFile=/home/jordi/scan3d/shared/.env.local
+ExecStart=/usr/bin/node server.js
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

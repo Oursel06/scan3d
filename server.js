@@ -1,19 +1,33 @@
 const express = require('express');
 const http = require('http');
+const path = require('path');
 const { Server } = require('socket.io');
+const auth = require('./auth');
 
 const app = express();
 const server = http.createServer(app);
 
-// CORS "*" pour autoriser la connexion WebSocket entrante depuis l'app Android
+// CORS restreint aux origines de SCAN3D_ORIGINS. Sans effet sur l'app Android :
+// un client natif n'envoie pas d'en-tete Origin.
 const io = new Server(server, {
-  cors: { origin: '*' }
+  cors: { origin: auth.corsOrigin }
 });
 
 const PORT = process.env.PORT || 3000;
+// Derriere un reverse proxy, HOST=127.0.0.1 evite d'exposer le service au LAN.
+const HOST = process.env.HOST || '0.0.0.0';
 
-// Sert les fichiers statiques de la PWA (index.html) depuis la racine
-app.use(express.static(__dirname));
+// Sonde de sante, volontairement hors du gate token.
+app.get('/healthz', (_req, res) => res.type('text/plain').send('ok'));
+
+app.use(auth.httpGuard);
+
+// Un seul asset a servir (three.js vient d'unpkg, socket.io.js est servi par
+// socket.io lui-meme) : une route explicite plutot qu'express.static(__dirname),
+// qui exposerait package.json, node_modules et le .env.local symlinke par le deploiement.
+app.get('/', (_req, res) => res.sendFile(path.join(__dirname, 'index.html')));
+
+io.use(auth.socketGuard);
 
 io.on('connection', (socket) => {
   console.log('Client connecte :', socket.id);
@@ -29,7 +43,6 @@ io.on('connection', (socket) => {
   socket.on('disconnect', () => console.log('Client deconnecte :', socket.id));
 });
 
-// Ecoute sur 0.0.0.0 (indispensable pour Render)
-server.listen(PORT, '0.0.0.0', () => {
-  console.log(`Serveur relais 3D a l'ecoute sur le port ${PORT}`);
+server.listen(PORT, HOST, () => {
+  console.log(`Serveur relais 3D a l'ecoute sur ${HOST}:${PORT}`);
 });

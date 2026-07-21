@@ -1,0 +1,38 @@
+# ─── scan3d.cube3d.fr — relais 3D temps réel (Express + socket.io :3017) ───
+# Bloc à poser dans /etc/caddy/Caddyfile de la WORKSTATION (.41).
+# Dual-scheme : le Pi frontal chaîne en HTTP plain, d'où la déclaration des deux schémas.
+http://scan3d.cube3d.fr, https://scan3d.cube3d.fr {
+	encode gzip
+
+	# socket.io : long-polling pour le handshake PUIS upgrade WebSocket.
+	# Caddy gère l'Upgrade nativement (rien à déclarer) ; on desserre les timeouts
+	# pour qu'un scan silencieux ne coupe pas la session, et flush_interval -1
+	# évite la mise en tampon de la phase polling.
+	@sio path /socket.io/*
+	handle @sio {
+		reverse_proxy 127.0.0.1:3017 {
+			flush_interval -1
+			transport http {
+				dial_timeout 5s
+				read_timeout 24h
+				write_timeout 24h
+			}
+			header_up Host {host}
+			header_up X-Forwarded-Proto https
+			header_up X-Forwarded-Port 443
+		}
+	}
+
+	handle {
+		reverse_proxy 127.0.0.1:3017 {
+			flush_interval -1
+			transport http {
+				read_timeout 5m
+				write_timeout 5m
+			}
+			header_up Host {host}
+			header_up X-Forwarded-Proto https
+			header_up X-Forwarded-Port 443
+		}
+	}
+}

@@ -1,0 +1,19 @@
+# ─── scan3d.cube3d.fr — proxy vers la workstation (à poser sur Pi29 ET Pi31) ───
+# Sans ce bloc sur le Pi frontal, le sous-domaine ne sort pas sur Internet
+# même si tout est correct sur la workstation.
+# WebSocket : timeouts longs + pas de buffering (socket.io).
+scan3d.cube3d.fr {
+    encode gzip
+    reverse_proxy 192.168.1.41 {
+        flush_interval -1
+        transport http {
+            dial_timeout 5s
+            read_timeout 24h
+            write_timeout 24h
+        }
+        header_up Host {host}
+        header_up X-Real-IP {remote_host}
+        header_up X-Forwarded-For {remote_host}
+        header_up X-Forwarded-Proto https
+    }
+}
