@@ -12,6 +12,12 @@ if (!TOKEN) {
 const TOKEN_BUF = Buffer.from(TOKEN, 'utf8');
 const COOKIE = 'scan3d_k';
 
+// Mode "ingestion ouverte" : accepte les clients SANS token, mais uniquement
+// comme EMETTEURS. Ils ne rejoignent pas la room 'viewers' et ne recoivent donc
+// aucun scan (cf. server.js). Necessaire pour une app dont l'URL est figee dans
+// le binaire et qui ne peut transmettre aucun token.
+const OPEN_INGEST = /^(1|true|oui|yes)$/i.test(process.env.SCAN3D_OPEN_INGEST || '');
+
 // CORS socket.io : ne concerne que les clients navigateur. Un client natif
 // (app Android) n'envoie pas d'en-tete Origin et n'est donc pas affecte.
 const ORIGINS = (process.env.SCAN3D_ORIGINS || 'https://scan3d.cube3d.fr')
@@ -81,9 +87,24 @@ function socketGuard(socket, next) {
     || fromBearer(h.headers.authorization)
     || fromCookie(h.headers.cookie);
 
-  if (tokenOk(t)) return next();
+  // authed pilote l'appartenance a la room 'viewers' : seuls les clients
+  // authentifies RECOIVENT les scans (cf. server.js).
+  if (tokenOk(t)) {
+    socket.data.authed = true;
+    return next();
+  }
 
-  console.warn('[scan3d] handshake refuse depuis', h.address);
+  // Le User-Agent distingue l'app Android du navigateur : indispensable au
+  // diagnostic, l'IP etant toujours celle du reverse proxy.
+  const ua = h.headers['user-agent'] || '(aucun)';
+
+  if (OPEN_INGEST) {
+    socket.data.authed = false;
+    console.warn('[scan3d] emetteur SANS token admis (ingestion ouverte) — ua=%s', ua);
+    return next();
+  }
+
+  console.warn('[scan3d] handshake REFUSE — ua=%s | jamais de token dans auth/query/cookie', ua);
   const err = new Error('unauthorized');
   err.data = { code: 'AUTH_REQUIRED' };
   next(err); // -> connect_error cote client, fermeture propre, PAS de reconnexion en boucle

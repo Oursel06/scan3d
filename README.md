@@ -36,16 +36,37 @@ La branche `main` suit l'upstream ; **tout le local vit sur `main-m29`**.
 - Le token vit uniquement dans `/home/jordi/scan3d/shared/.env.local` (chmod 600),
   jamais dans git. Modèle : `deploy/.env.example`.
 
-### Accès
+### Accès et modèle de sécurité
 
     https://scan3d.cube3d.fr/?k=<TOKEN>
 
 Le serveur pose ensuite un cookie : les rechargements suivants n'ont plus besoin de `?k=`.
-Sans token valide → **401**, et le handshake socket.io est rejeté (`unauthorized`).
+La page web renvoie **401** sans token, toujours.
 
-App Android : URL `https://scan3d.cube3d.fr`, token via
-`opts.auth = singletonMap("token", TOKEN)` (socket.io-client-java 2.x)
-ou `opts.query = "k=" + TOKEN` (1.x, sans champ `auth`).
+Pour socket.io, deux modes selon `SCAN3D_OPEN_INGEST` :
+
+| | strict (défaut) | ingestion ouverte (`=true`) |
+|---|---|---|
+| Client **avec** token | émet et reçoit | émet et reçoit |
+| Client **sans** token | rejeté (`unauthorized`) | **émet seulement, ne reçoit rien** |
+
+L'ingestion ouverte existe parce que **l'app Android a son URL figée dans le binaire**
+et ne peut transmettre aucun token. Elle n'a besoin que d'émettre : les clients non
+authentifiés ne rejoignent pas la room `viewers`, donc les scans ne leur sont jamais
+diffusés. Compromis assumé : un tiers connaissant l'adresse peut injecter des points
+parasites, mais **ne peut pas voir les scans**.
+
+Si un jour l'URL de l'app devient modifiable, préférer le mode strict :
+il suffit de configurer `https://scan3d.cube3d.fr/?k=<TOKEN>` comme adresse du serveur
+(le token de la query est accepté au handshake), puis de retirer `SCAN3D_OPEN_INGEST`.
+
+### Taille des lots
+
+`maxHttpBufferSize` est porté à **32 Mo** (`SCAN3D_MAX_BATCH_MB`). Le défaut socket.io
+est de 1 Mo, soit ~16 000 points : au-delà le serveur **ferme la connexion sans erreur
+applicative** et le client boucle en reconnexion — symptôme observé le 21/07 (app bloquée
+sur « connexion… », ~20 000 points à l'écran). 400 000 points ≈ 26 Mo, relayés en ~8 s.
+Des lots d'environ 10 000 points donneraient un affichage progressif et bien plus fluide.
 
 ### ⚠ Hairpin de la box et long-polling
 

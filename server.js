@@ -36,16 +36,22 @@ app.get('/', (_req, res) => res.sendFile(path.join(__dirname, 'index.html')));
 io.use(auth.socketGuard);
 
 io.on('connection', (socket) => {
-  console.log('Client connecte :', socket.id);
+  // Seuls les clients porteurs du token rejoignent 'viewers' et RECOIVENT les
+  // scans. Les emetteurs non authentifies (app dont l'URL est figee) peuvent
+  // publier mais ne voient rien : la diffusion reste confidentielle.
+  const authed = socket.data.authed === true;
+  if (authed) socket.join('viewers');
+  console.log('Client connecte :', socket.id, authed ? '[viewer authentifie]' : '[emetteur seul]',
+    '- ua:', socket.handshake.headers['user-agent'] || '(aucun)');
 
-  // Reception des donnees 3D -> broadcast immediat a tous les AUTRES clients.
+  // Reception des donnees 3D -> rediffusion aux viewers authentifies (l'emetteur exclu).
   // Le 2e argument (ack) est un callback d'accuse de reception : on l'appelle une fois
   // le lot rediffuse, ce qui permet a l'app Android de marquer ces points comme "envoyes" (verts).
   socket.on('new_points', (data, ack) => {
     const n = Array.isArray(data) ? data.length : 0;
-    socket.broadcast.emit('draw_points', data);
+    socket.to('viewers').emit('draw_points', data);
     if (typeof ack === 'function') ack({ ok: true, count: n });
-    console.log(`  lot recu de ${socket.id} : ${n} points`);
+    console.log(`  lot recu de ${socket.id} : ${n} points -> ${io.sockets.adapter.rooms.get('viewers')?.size ?? 0} viewer(s)`);
   });
 
   // La raison est indispensable au diagnostic : un lot trop gros produit
