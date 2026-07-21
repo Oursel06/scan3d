@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
-  <title>Nuage de Points 3D — Temps Reel</title>
+  <title>Reconstruction 3D — Blocs Temps Reel</title>
   <style>
     html, body { margin: 0; height: 100%; overflow: hidden; background: #101014; }
     #app { position: fixed; inset: 0; }
@@ -34,7 +34,7 @@
 <body>
   <div id="app"></div>
   <div id="hud">
-    <span id="dot"></span> <span id="state">Connexion…</span> &nbsp;|&nbsp; Points : <b id="count">0</b>
+    <span id="dot"></span> <span id="state">Connexion…</span> &nbsp;|&nbsp; Blocs : <b id="count">0</b>
   </div>
 
   <script type="module">
@@ -44,16 +44,17 @@
     // Connexion auto (compatible HTTP et HTTPS/WSS grace au chemin relatif)
     const socket = io();
 
-    const MAX_POINTS = 500000; // capacite du buffer pre-alloue
+    const VOXEL = 0.05;          // taille d'un bloc : 5 cm
+    const INV_VOXEL = 1 / VOXEL;
+    let capacity = 200000;       // capacite initiale de l'InstancedMesh (blocs)
 
     // ---- Scene / Camera / Renderer -------------------------------------
     const container = document.getElementById('app');
     const scene = new THREE.Scene();
     scene.background = new THREE.Color(0x101014);
 
-    // Les points ARCore sont en METRES (repere monde) : scene a l'echelle metrique.
     const camera = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 0.01, 1000);
-    camera.position.set(2, 1.5, 3); // ~3,5 m de l'origine
+    camera.position.set(3, 2.5, 4);
 
     const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
     renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
@@ -63,122 +64,185 @@
     const controls = new OrbitControls(camera, renderer.domElement);
     controls.enableDamping = true;
 
-    // Reperes a l'echelle metrique : axes de 1 m + grille de 10x10 m (mailles de 0,5 m)
-    scene.add(new THREE.AxesHelper(1));
-    const grid = new THREE.GridHelper(10, 20, 0x444455, 0x2a2a34);
+    // Eclairage : ambiant + directionnel -> les faces des cubes s'ombrent
+    // differemment (aspect volumetrique facon Minecraft).
+    scene.add(new THREE.AmbientLight(0xffffff, 0.75));
+    const dir = new THREE.DirectionalLight(0xffffff, 0.9);
+    dir.position.set(1, 2, 1.5);
+    scene.add(dir);
+    const dir2 = new THREE.DirectionalLight(0xffffff, 0.35);
+    dir2.position.set(-1, -0.5, -1);
+    scene.add(dir2);
+
+    scene.add(new THREE.AxesHelper(0.5));
+    const grid = new THREE.GridHelper(12, 24, 0x444455, 0x24242c);
     scene.add(grid);
 
-    // ---- Geometrie de points pre-allouee (optimisee) ------------------
-    const positions = new Float32Array(MAX_POINTS * 3);
-    const posAttr = new THREE.BufferAttribute(positions, 3);
-    posAttr.setUsage(THREE.DynamicDrawUsage); // buffer mis a jour souvent
+    // ---- Grille de voxels (InstancedMesh de cubes) ---------------------
+    const boxGeom = new THREE.BoxGeometry(VOXEL, VOXEL, VOXEL);
+    const boxMat = new THREE.MeshLambertMaterial({ vertexColors: false });
 
-    const colors = new Float32Array(MAX_POINTS * 3); // couleur RGB par point (0..1)
-    const colAttr = new THREE.BufferAttribute(colors, 3);
-    colAttr.setUsage(THREE.DynamicDrawUsage);
+    let mesh = new THREE.InstancedMesh(boxGeom, boxMat, capacity);
+    mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+    mesh.count = 0;
+    mesh.frustumCulled = false;
+    scene.add(mesh);
 
-    const geometry = new THREE.BufferGeometry();
-    geometry.setAttribute('position', posAttr);
-    geometry.setAttribute('color', colAttr);
-    geometry.setDrawRange(0, 0); // on ne dessine que les points recus
+    // Etat des voxels : cle "ix,iy,iz" -> index d'instance
+    const voxelIndex = new Map();
+    // Accumulateurs de couleur par voxel (moyenne des couleurs des points tombes dedans)
+    let sumR = new Float32Array(capacity);
+    let sumG = new Float32Array(capacity);
+    let sumB = new Float32Array(capacity);
+    let cnt  = new Uint32Array(capacity);
+    let occupied = 0;
 
-    // Couleur reelle par point (vertexColors) ; taille en metres avec attenuation
-    // perspective pour un rendu plus realiste (points proches plus gros).
-    let pointSize = 0.012; // ~1,2 cm
-    const material = new THREE.PointsMaterial({
-      size: pointSize, vertexColors: true, sizeAttenuation: true
-    });
-    const cloud = new THREE.Points(geometry, material);
-    scene.add(cloud);
+    const bboxMin = new THREE.Vector3(Infinity, Infinity, Infinity);
+    const bboxMax = new THREE.Vector3(-Infinity, -Infinity, -Infinity);
+    let fitted = false;
 
-    const DEFAULT_COLOR = [0.20, 0.80, 1.0]; // cyan de repli si aucune couleur transmise
-
-    let count = 0;           // nombre de points actuellement affiches
-    let fitted = false;      // recadrage auto effectue au premier nuage ?
+    const dummy = new THREE.Object3D();
+    const tmpColor = new THREE.Color();
     const countEl = document.getElementById('count');
 
-    // Parse l'entree en { pos:[x,y,z,...], col:[r,g,b,...] } (couleurs normalisees 0..1).
-    // Accepte [x,y,z] ou [x,y,z,r,g,b] (r,g,b en 0..255) et {x,y,z,r,g,b}.
-    function parsePoints(data) {
-      if (!data) return null;
-      if (data.points) data = data.points;       // { points: [...] }
-      if (!Array.isArray(data)) return null;
-      const pos = [], col = [];
-      const push = (x, y, z, r, g, b) => {
-        if (!(Number.isFinite(x) && Number.isFinite(y) && Number.isFinite(z))) return;
-        pos.push(x, y, z);
-        if (Number.isFinite(r) && Number.isFinite(g) && Number.isFinite(b))
-          col.push(r / 255, g / 255, b / 255);
-        else
-          col.push(DEFAULT_COLOR[0], DEFAULT_COLOR[1], DEFAULT_COLOR[2]);
-      };
-      if (typeof data[0] === 'number') {          // deja plat [x,y,z,...]
-        for (let i = 0; i + 2 < data.length; i += 3) push(data[i], data[i + 1], data[i + 2]);
-        return { pos, col };
+    function growCapacity() {
+      const newCap = capacity * 2;
+      const newMesh = new THREE.InstancedMesh(boxGeom, boxMat, newCap);
+      newMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+      newMesh.count = occupied;
+      newMesh.frustumCulled = false;
+      // Recopie des matrices et couleurs existantes
+      for (let i = 0; i < occupied; i++) {
+        mesh.getMatrixAt(i, dummy.matrix);
+        newMesh.setMatrixAt(i, dummy.matrix);
       }
-      for (const p of data) {
-        if (Array.isArray(p)) push(p[0], p[1], p[2], p[3], p[4], p[5]);
-        else if (p && typeof p === 'object') push(p.x, p.y, p.z, p.r, p.g, p.b);
+      if (mesh.instanceColor) {
+        newMesh.instanceColor = new THREE.InstancedBufferAttribute(new Float32Array(newCap * 3), 3);
+        newMesh.instanceColor.array.set(mesh.instanceColor.array.subarray(0, occupied * 3));
       }
-      return { pos, col };
+      scene.remove(mesh);
+      mesh.dispose();
+      mesh = newMesh;
+      scene.add(mesh);
+
+      const nR = new Float32Array(newCap); nR.set(sumR); sumR = nR;
+      const nG = new Float32Array(newCap); nG.set(sumG); sumG = nG;
+      const nB = new Float32Array(newCap); nB.set(sumB); sumB = nB;
+      const nC = new Uint32Array(newCap);  nC.set(cnt);  cnt  = nC;
+      capacity = newCap;
     }
 
-    // Recadre la camera sur l'ensemble du nuage courant.
-    function fitToCloud() {
-      if (!count) return;
-      geometry.computeBoundingSphere();
-      const s = geometry.boundingSphere;
-      if (!s || !Number.isFinite(s.radius) || s.radius <= 0) return;
-      const r = s.radius, c = s.center;
-      const dist = (r / Math.sin(THREE.MathUtils.degToRad(camera.fov * 0.5))) * 1.3;
-      const dir = new THREE.Vector3(1, 0.6, 1).normalize();
-      controls.target.copy(c);
-      camera.position.copy(c).addScaledVector(dir, dist);
+    // Ajoute un point (x,y,z en metres, r,g,b en 0..255) a la grille de voxels.
+    function addPoint(x, y, z, r, g, b) {
+      if (!(Number.isFinite(x) && Number.isFinite(y) && Number.isFinite(z))) return;
+      const ix = Math.floor(x * INV_VOXEL);
+      const iy = Math.floor(y * INV_VOXEL);
+      const iz = Math.floor(z * INV_VOXEL);
+      const key = ix + ',' + iy + ',' + iz;
+
+      let idx = voxelIndex.get(key);
+      if (idx === undefined) {
+        if (occupied >= capacity) growCapacity();
+        idx = occupied++;
+        voxelIndex.set(key, idx);
+        // Position du bloc = centre de la cellule
+        dummy.position.set((ix + 0.5) * VOXEL, (iy + 0.5) * VOXEL, (iz + 0.5) * VOXEL);
+        dummy.rotation.set(0, 0, 0);
+        dummy.updateMatrix();
+        mesh.setMatrixAt(idx, dummy.matrix);
+        mesh.count = occupied;
+        mesh.instanceMatrix.needsUpdate = true;
+
+        const cx = (ix + 0.5) * VOXEL, cy = (iy + 0.5) * VOXEL, cz = (iz + 0.5) * VOXEL;
+        if (cx < bboxMin.x) bboxMin.x = cx; if (cx > bboxMax.x) bboxMax.x = cx;
+        if (cy < bboxMin.y) bboxMin.y = cy; if (cy > bboxMax.y) bboxMax.y = cy;
+        if (cz < bboxMin.z) bboxMin.z = cz; if (cz > bboxMax.z) bboxMax.z = cz;
+      }
+      // Moyenne cumulative de la couleur
+      sumR[idx] += r; sumG[idx] += g; sumB[idx] += b; cnt[idx] += 1;
+      const c = cnt[idx];
+      tmpColor.setRGB(sumR[idx] / c / 255, sumG[idx] / c / 255, sumB[idx] / c / 255);
+      mesh.setColorAt(idx, tmpColor);
+      mesh.instanceColor.needsUpdate = true;
+    }
+
+    // ---- Decodage des lots recus ---------------------------------------
+    // Format binaire : [uint32 N][N x 3 float32 xyz][N x 3 uint8 rgb], little-endian.
+    function addBinary(buf) {
+      const dv = new DataView(buf);
+      if (dv.byteLength < 4) return;
+      const n = dv.getUint32(0, true);
+      const posOff = 4;
+      const colOff = 4 + 12 * n;
+      if (dv.byteLength < colOff + 3 * n) return; // lot tronque
+      for (let i = 0; i < n; i++) {
+        const x = dv.getFloat32(posOff + i * 12, true);
+        const y = dv.getFloat32(posOff + i * 12 + 4, true);
+        const z = dv.getFloat32(posOff + i * 12 + 8, true);
+        const r = dv.getUint8(colOff + i * 3);
+        const g = dv.getUint8(colOff + i * 3 + 1);
+        const b = dv.getUint8(colOff + i * 3 + 2);
+        addPoint(x, y, z, r, g, b);
+      }
+    }
+
+    // Repli : ancien format JSON ([x,y,z] ou [x,y,z,r,g,b] ou {x,y,z,...}).
+    function addJson(data) {
+      if (data && data.points) data = data.points;
+      if (!Array.isArray(data)) return;
+      if (typeof data[0] === 'number') {
+        for (let i = 0; i + 2 < data.length; i += 3) addPoint(data[i], data[i + 1], data[i + 2], 180, 180, 180);
+        return;
+      }
+      for (const p of data) {
+        if (Array.isArray(p)) addPoint(p[0], p[1], p[2], p[3] ?? 180, p[4] ?? 180, p[5] ?? 180);
+        else if (p && typeof p === 'object') addPoint(p.x, p.y, p.z, p.r ?? 180, p.g ?? 180, p.b ?? 180);
+      }
+    }
+
+    socket.on('draw_points', (data) => {
+      if (data instanceof ArrayBuffer) addBinary(data);
+      else if (ArrayBuffer.isView(data)) addBinary(data.buffer);
+      else addJson(data);
+
+      countEl.textContent = occupied;
+      if (!fitted && occupied > 0) { fitToScene(); fitted = true; }
+    });
+
+    // ---- Recadrage camera sur la reconstruction ------------------------
+    function fitToScene() {
+      if (occupied === 0 || !Number.isFinite(bboxMin.x)) return;
+      const center = new THREE.Vector3().addVectors(bboxMin, bboxMax).multiplyScalar(0.5);
+      const size = new THREE.Vector3().subVectors(bboxMax, bboxMin);
+      const radius = Math.max(size.length() * 0.5, VOXEL * 4);
+      const dist = (radius / Math.sin(THREE.MathUtils.degToRad(camera.fov * 0.5))) * 1.25;
+      const d = new THREE.Vector3(1, 0.6, 1).normalize();
+      controls.target.copy(center);
+      camera.position.copy(center).addScaledVector(d, dist);
       camera.near = Math.max(dist / 1000, 0.001);
-      camera.far = dist * 100 + r * 10;
+      camera.far = dist * 100 + radius * 10;
       camera.updateProjectionMatrix();
       controls.update();
     }
 
-    function clearCloud() {
-      count = 0;
+    function clearScene() {
+      voxelIndex.clear();
+      occupied = 0;
+      mesh.count = 0;
+      mesh.instanceMatrix.needsUpdate = true;
+      if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
+      sumR.fill(0); sumG.fill(0); sumB.fill(0); cnt.fill(0);
+      bboxMin.set(Infinity, Infinity, Infinity);
+      bboxMax.set(-Infinity, -Infinity, -Infinity);
       fitted = false;
-      geometry.setDrawRange(0, 0);
-      posAttr.needsUpdate = true;
-      colAttr.needsUpdate = true;
       countEl.textContent = 0;
     }
 
-    // Reception temps reel -> ajout des points (+ couleurs) a la geometrie
-    socket.on('draw_points', (data) => {
-      const parsed = parsePoints(data);
-      if (!parsed) return;
-      let n = Math.floor(parsed.pos.length / 3);
-      if (!n) return;
-
-      if (count + n > MAX_POINTS) { count = 0; fitted = false; } // buffer plein -> on repart de zero
-      n = Math.min(n, MAX_POINTS - count);
-
-      positions.set(parsed.pos.slice(0, n * 3), count * 3);
-      colors.set(parsed.col.slice(0, n * 3), count * 3);
-      count += n;
-
-      posAttr.needsUpdate = true;                 // renvoi des buffers au GPU
-      colAttr.needsUpdate = true;
-      geometry.setDrawRange(0, count);
-      countEl.textContent = count;
-
-      // Recadrage automatique des le tout premier nuage recu.
-      if (!fitted) { fitToCloud(); fitted = true; }
-    });
-
-    // Raccourcis : R = recadrer, C = effacer, +/- = taille des points
+    // Raccourcis : R = recadrer, C = effacer
     addEventListener('keydown', (e) => {
       const k = e.key.toLowerCase();
-      if (k === 'r') fitToCloud();
-      else if (k === 'c') clearCloud();
-      else if (k === '+' || k === '=') { pointSize = Math.min(pointSize * 1.25, 1); material.size = pointSize; }
-      else if (k === '-') { pointSize = Math.max(pointSize / 1.25, 0.001); material.size = pointSize; }
+      if (k === 'r') fitToScene();
+      else if (k === 'c') clearScene();
     });
 
     // ---- Etat de connexion (HUD) ---------------------------------------
