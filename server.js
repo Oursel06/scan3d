@@ -1,6 +1,8 @@
 const express = require('express');
 const http = require('http');
 const path = require('path');
+const crypto = require('crypto');
+const fsp = require('fs').promises;
 const { Server } = require('socket.io');
 const auth = require('./auth');
 
@@ -30,6 +32,67 @@ const HOST = process.env.HOST || '0.0.0.0';
 app.get('/healthz', (_req, res) => res.type('text/plain').send('ok'));
 
 app.use(auth.httpGuard);
+
+// --- Sauvegardes de scenes (persistees dans sauv.json) ---------------------
+// Fichier a la racine de scan3d ; surchargeable via SCAN3D_SAVES pour le placer
+// dans shared/ et survivre aux redeploiements (le root est ecrase a chaque deploy).
+// Un enregistrement : { id, name, thumb (dataURL JPEG leger), camera, voxel, count,
+// points (base64 du format fil [uint32 n][float32 xyz][uint8 rgb]), createdAt, updatedAt }.
+const SAVES_FILE = process.env.SCAN3D_SAVES || path.join(__dirname, 'sauv.json');
+
+// Corps JSON volumineux : un nuage de voxels encode en base64 pese quelques Mo.
+app.use(express.json({ limit: '96mb' }));
+
+// Serialise les acces fichier (evite les read-modify-write concurrents).
+let savesChain = Promise.resolve();
+function withSaves(task) {
+  const run = savesChain.then(task, task);
+  savesChain = run.then(() => {}, () => {});
+  return run;
+}
+async function readSaves() {
+  try { return JSON.parse(await fsp.readFile(SAVES_FILE, 'utf8')); }
+  catch (e) { if (e.code === 'ENOENT') return []; throw e; }
+}
+const stripPoints = (s) => { const { points, ...rest } = s; return rest; };
+
+// Liste (sans les points) : modale de chargement legere.
+app.get('/api/saves', (_req, res) => withSaves(async () => {
+  res.json((await readSaves()).map(stripPoints));
+}).catch((e) => res.status(500).json({ error: String(e) })));
+
+// Une sauvegarde complete (avec points) pour le chargement.
+app.get('/api/saves/:id', (req, res) => withSaves(async () => {
+  const s = (await readSaves()).find((x) => x.id === req.params.id);
+  if (!s) return res.status(404).json({ error: 'introuvable' });
+  res.json(s);
+}).catch((e) => res.status(500).json({ error: String(e) })));
+
+// Cree, ou ECRASE si un id existant est fourni (scene chargee puis re-sauvegardee).
+app.post('/api/saves', (req, res) => withSaves(async () => {
+  const b = req.body || {};
+  if (typeof b.points !== 'string' || !b.name) {
+    return res.status(400).json({ error: 'name et points requis' });
+  }
+  const arr = await readSaves();
+  const now = new Date().toISOString();
+  const rec = {
+    id: b.id || crypto.randomUUID(),
+    name: String(b.name).slice(0, 120),
+    thumb: typeof b.thumb === 'string' ? b.thumb : '',
+    camera: b.camera || null,
+    voxel: b.voxel || null,
+    count: b.count | 0,
+    points: b.points,
+    createdAt: now,
+    updatedAt: now,
+  };
+  const i = arr.findIndex((x) => x.id === rec.id);
+  if (i >= 0) { rec.createdAt = arr[i].createdAt || now; arr[i] = rec; }
+  else { arr.push(rec); }
+  await fsp.writeFile(SAVES_FILE, JSON.stringify(arr), 'utf8');
+  res.json(stripPoints(rec));
+}).catch((e) => res.status(500).json({ error: String(e) })));
 
 // Un seul asset a servir (three.js vient d'unpkg, socket.io.js est servi par
 // socket.io lui-meme) : une route explicite plutot qu'express.static(__dirname),
