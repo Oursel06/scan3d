@@ -1,92 +1,232 @@
-# scan3d
-Projet scan 3D
+# Scan3D — reconstruction 3D en temps réel
 
-Serveur relais WebSocket + page d'affichage de nuages de points 3D en temps réel :
-l'app Android émet `new_points`, le serveur rediffuse `draw_points` aux autres clients,
-la page les rend en voxels (three.js).
+Serveur relais **WebSocket** + **viewer web** three.js pour visualiser, en direct, un
+nuage de points 3D capturé par un smartphone. Le téléphone filme une scène, en extrait
+des points colorés via l'API de profondeur d'ARCore, et les envoie au serveur ; tout
+navigateur connecté voit le nuage se construire et peut tourner autour.
+
+Ce dépôt contient **le serveur et le viewer**. L'application Android de capture vit dans
+un dépôt séparé — voir [Application Android](#application-android).
+
+> Fork de [Oursel06/scan3d](https://github.com/Oursel06/scan3d), enrichi pour un
+> hébergement autonome : authentification par token, envoi par lots, format binaire,
+> et outillage de déploiement. La branche `main` suit l'amont ; tout l'ajout vit sur
+> **`main-m29`** (branche par défaut de ce fork).
 
 ---
 
-## Déploiement M2-9 (scan3d.cube3d.fr)
+## Vue d'ensemble
 
-Ce dépôt est un fork de [Oursel06/scan3d](https://github.com/Oursel06/scan3d).
-La branche `main` suit l'upstream ; **tout le local vit sur `main-m29`**.
+Trois composants, un seul rôle pour le serveur : **relayer**, sans rien stocker.
 
-    git fetch upstream && git merge upstream/main    # récupérer les mises à jour amont
+```mermaid
+flowchart LR
+    A["📱 App Android<br/>(ARCore Depth)"] -- "new_points<br/>lots de points" --> S(("🔀 Serveur relais<br/>Express + socket.io"))
+    S -- "ack {ok, count}" --> A
+    S -- "draw_points" --> V1["🖥️ Viewer web<br/>(three.js)"]
+    S -- "draw_points" --> V2["🖥️ Autre viewer"]
+    V1 -. "rendu voxels 5 cm" .-> U["👤"]
+```
 
-### Différences avec l'upstream
+- **L'app** émet l'événement `new_points` avec un lot de points `{x, y, z, r, g, b}`.
+- **Le serveur** rediffuse chaque lot en `draw_points` à tous les *autres* clients
+  authentifiés, et renvoie un accusé de réception `{ok, count}`.
+- **Le viewer** agrège les points en voxels et affiche le nuage, navigable à la souris.
 
-| Modif | Pourquoi |
-|---|---|
-| `auth.js` (nouveau) | Gate par token partagé : page **et** handshake socket.io |
-| `HOST` configurable | `127.0.0.1` derrière le reverse proxy, au lieu de `0.0.0.0` |
-| Route `/` explicite | Remplace `express.static(__dirname)`, qui exposait `package.json`, `node_modules` et le symlink `.env.local` |
-| CORS restreint | `SCAN3D_ORIGINS` au lieu de `*` — sans effet sur l'app Android (un client natif n'envoie pas d'`Origin`) |
-| `transports: ['websocket', 'polling']` | Voir « hairpin » plus bas |
+Le serveur est **sans état** : rien n'est persisté, un client qui arrive après coup ne
+voit que ce qui est émis à partir de sa connexion.
 
-### Chaîne de production
+---
 
-    DNS OVH (wildcard *.cube3d.fr) → Livebox :443 → VIP .32 (Pi29, TLS)
-      → 192.168.1.41:80 (Caddy workstation) → 127.0.0.1:3017 (ce service)
+## Comment ça marche
 
-- Service : `scan3d.service` (systemd système), port **3017**
-- Déploiement : `~/M2-9/ops/m29 deploy scan3d` — rollback : `m29 rollback scan3d`
-- Blocs Caddy : `deploy/caddy-workstation.snippet` (.41) et `deploy/caddy-pi.snippet`
-  (à poser sur **Pi29 et Pi31**)
-- Le token vit uniquement dans `/home/jordi/scan3d/shared/.env.local` (chmod 600),
-  jamais dans git. Modèle : `deploy/.env.example`.
+### Protocole socket.io
 
-### Accès et modèle de sécurité
+| Sens | Événement | Charge utile | Réponse |
+|---|---|---|---|
+| App → serveur | `new_points` | tableau de points (voir formats) | ack `{ok: true, count: N}` |
+| Serveur → viewers | `draw_points` | le lot, tel quel | — |
 
-    https://scan3d.cube3d.fr/?k=<TOKEN>
+Le serveur ne rediffuse qu'aux membres de la room `viewers` **autres que l'émetteur** :
+un client ne reçoit jamais ce qu'il a lui-même envoyé.
 
-Le serveur pose ensuite un cookie : les rechargements suivants n'ont plus besoin de `?k=`.
-La page web renvoie **401** sans token, toujours.
+### Formats de points
 
-Pour socket.io, deux modes selon `SCAN3D_OPEN_INGEST` :
+Le viewer accepte deux encodages, au choix de l'émetteur :
 
-| | strict (défaut) | ingestion ouverte (`=true`) |
+**JSON** — lisible, le plus simple :
+```json
+[{ "x": 0.12, "y": -0.03, "z": 1.8, "r": 200, "g": 180, "b": 150 }, …]
+```
+
+**Binaire** — ~4× plus compact (15 octets/point contre ~48), petit-boutiste :
+```
+[uint32 N][float32 x,y,z × N][uint8 r,g,b × N]
+```
+
+Coordonnées en **mètres**, couleurs sur **0–255**. Repère main droite, +Y vers le haut,
+−Z vers l'avant (identique à three.js).
+
+---
+
+## Démarrage rapide
+
+```bash
+npm install
+SCAN3D_TOKEN=$(openssl rand -hex 24) npm start
+# → viewer sur http://localhost:3000/?k=<le-token-affiché>
+```
+
+Le serveur **refuse de démarrer sans `SCAN3D_TOKEN`** : c'est volontaire, pour ne jamais
+exposer un relais ouvert par accident.
+
+---
+
+## Configuration
+
+Tout passe par l'environnement (aucune valeur sensible dans le code) :
+
+| Variable | Défaut | Rôle |
 |---|---|---|
-| Client **avec** token | émet et reçoit | émet et reçoit |
-| Client **sans** token | rejeté (`unauthorized`) | **émet seulement, ne reçoit rien** |
+| `SCAN3D_TOKEN` | *(requis)* | Secret partagé. Sans lui, le serveur ne démarre pas. |
+| `PORT` | `3000` | Port d'écoute. |
+| `HOST` | `0.0.0.0` | Mettre `127.0.0.1` derrière un reverse proxy. |
+| `SCAN3D_ORIGINS` | `https://scan3d.cube3d.fr` | Origines CORS autorisées (navigateurs). Sans effet sur un client natif. |
+| `SCAN3D_MAX_BATCH_MB` | `32` | Taille max d'un lot. **Ne pas descendre à 1** (voir dépannage). |
+| `SCAN3D_OPEN_INGEST` | *(absent)* | `true` = accepter les émetteurs sans token (voir sécurité). |
 
-L'ingestion ouverte existe parce que **l'app Android a son URL figée dans le binaire**
-et ne peut transmettre aucun token. Elle n'a besoin que d'émettre : les clients non
-authentifiés ne rejoignent pas la room `viewers`, donc les scans ne leur sont jamais
-diffusés. Compromis assumé : un tiers connaissant l'adresse peut injecter des points
-parasites, mais **ne peut pas voir les scans**.
+---
 
-Si un jour l'URL de l'app devient modifiable, préférer le mode strict :
-il suffit de configurer `https://scan3d.cube3d.fr/?k=<TOKEN>` comme adresse du serveur
-(le token de la query est accepté au handshake), puis de retirer `SCAN3D_OPEN_INGEST`.
+## Sécurité et modèle d'accès
 
-### Taille des lots
+Le token protège **la page web** et **le handshake socket.io**. Il est accepté via
+`?k=<token>` dans l'URL, un cookie posé au premier chargement, l'en-tête
+`X-Scan3d-Token`, `Authorization: Bearer`, ou le champ `auth.token` du handshake.
 
-`maxHttpBufferSize` est porté à **32 Mo** (`SCAN3D_MAX_BATCH_MB`). Le défaut socket.io
-est de 1 Mo, soit ~16 000 points : au-delà le serveur **ferme la connexion sans erreur
-applicative** et le client boucle en reconnexion — symptôme observé le 21/07 (app bloquée
-sur « connexion… », ~20 000 points à l'écran). 400 000 points ≈ 26 Mo, relayés en ~8 s.
-Des lots d'environ 10 000 points donneraient un affichage progressif et bien plus fluide.
+Deux modes, selon `SCAN3D_OPEN_INGEST` :
 
-### ⚠ Hairpin de la box et long-polling
+| Client | strict *(défaut)* | ingestion ouverte |
+|---|---|---|
+| **avec** token | émet **et** reçoit | émet et reçoit |
+| **sans** token | rejeté (`unauthorized`) | **émet seulement — ne reçoit aucun scan** |
 
-Depuis le LAN, `scan3d.cube3d.fr` peut résoudre vers l'IP publique : le trafic ressort
-puis rentre par la box (hairpin). Dans ce cas le **long-polling** de socket.io est peu
-fiable (le GET en attente est complété par un ping au lieu des données), alors que le
-**WebSocket passe sans problème**. D'où l'ordre `['websocket', 'polling']` côté client.
+L'ingestion ouverte sert quand un émetteur ne peut pas transmettre de token (p. ex. une
+app dont l'adresse est figée) : il peut publier, mais ne rejoint pas la room `viewers`,
+donc ne voit jamais les scans. Compromis : un tiers connaissant l'adresse pourrait
+injecter des points parasites, sans jamais pouvoir observer la capture.
 
-Vérifié : le relais en polling fonctionne sur toute la chaîne interne
-(backend direct, Caddy .41, Pi29 via la VIP) — seul le trajet par la box le dégrade.
+> Le token ne doit jamais être commité. En production il vit dans un fichier
+> d'environnement hors dépôt (voir [`deploy/.env.example`](deploy/.env.example)).
 
-### Tests
+---
 
-    npm install                                          # installe socket.io-client (devDep)
-    SCAN3D_TOKEN=$TOK npm run e2e -- https://scan3d.cube3d.fr
+## Le viewer web
 
-Vérifie le refus sans token, le refus avec mauvais token, puis le relais
-`new_points` → `draw_points` entre deux clients. Ajouter `--polling` pour tester le repli.
+Rendu three.js : chaque point est aggloméré dans un **voxel** (cube de 5 cm par défaut),
+avec moyenne des couleurs, occlusion ambiante et masquage des faces internes.
 
-Note : le handshake **Engine.IO** (`GET /socket.io/?EIO=4&transport=polling`) renvoie un
-`sid` même sans token — c'est la couche transport. Le rejet a lieu à la connexion
-**Socket.IO** juste après, donc aucun événement ne passe. Tester avec `tools/e2e.js`,
-pas avec un simple curl sur le handshake.
+| Interaction | Effet |
+|---|---|
+| Souris / doigt | Orbite, zoom, panoramique |
+| Touche **R** | Recadre la vue sur le nuage |
+| Touche **C** | Efface le nuage |
+| `?voxel=0.03` | Taille de voxel en mètres (ici 3 cm) |
+| `?k=<token>` | Jeton d'accès |
+
+---
+
+## Client de test
+
+`tools/e2e.js` remplace l'app pour valider la chaîne de bout en bout — sans téléphone :
+
+```bash
+SCAN3D_TOKEN=<token> npm run e2e -- https://votre-serveur
+SCAN3D_TOKEN=<token> npm run e2e -- https://votre-serveur --polling
+```
+
+Il vérifie que la page exige le token, qu'un émetteur sans token ne reçoit aucun scan,
+puis que `new_points` est bien relayé en `draw_points` entre deux clients.
+
+> **Piège de diagnostic.** Le handshake **Engine.IO**
+> (`GET /socket.io/?EIO=4&transport=polling`) renvoie un `sid` *même sans token* : c'est
+> la couche transport. Le rejet a lieu à la connexion **Socket.IO** juste après. Ne pas
+> conclure à une faille avec un simple `curl` — utiliser `tools/e2e.js`.
+
+---
+
+## Déploiement (instance `scan3d.cube3d.fr`)
+
+Cette section documente le déploiement de référence ; elle est propre à cette instance.
+
+```
+DNS (wildcard) → box :443 → reverse proxy TLS → workstation :80 (Caddy) → 127.0.0.1:3017
+```
+
+- Service **systemd** `scan3d.service`, port **3017**, `HOST=127.0.0.1`.
+- Déploiement : `ops/m29 deploy scan3d` — rollback : `m29 rollback scan3d`.
+  Config dans [`deploy/`](deploy) : `m29.conf`, unité systemd, snippets Caddy
+  (workstation **et** Pi frontal), `.env.example`.
+- **Diffusion de l'APK** : la route `GET /apk` sert le fichier
+  `shared/scan3d.apk` (hors dépôt), derrière le même token — installation sur le
+  téléphone sans câble ni adb.
+
+### Différences avec l'amont
+
+| Modification | Pourquoi |
+|---|---|
+| `auth.js` (nouveau) | Gate par token : page **et** handshake socket.io. |
+| `maxHttpBufferSize` réglable | Lève la limite de 1 Mo (voir dépannage). |
+| `HOST` configurable | `127.0.0.1` derrière le proxy plutôt que `0.0.0.0`. |
+| Route `/` explicite | Remplace `express.static(__dirname)`, qui exposait `package.json`, `node_modules`, et le `.env.local` symlinké. |
+| CORS restreint | `SCAN3D_ORIGINS` au lieu de `*`. |
+| Room `viewers` | Sépare émission et réception (base de l'ingestion ouverte). |
+
+Récupérer les mises à jour de l'amont :
+```bash
+git fetch upstream && git merge upstream/main
+```
+
+---
+
+## Dépannage
+
+**L'app reste sur « connexion… » et rien ne s'affiche.** Presque toujours la limite de
+taille : socket.io plafonne un message à **1 Mo par défaut** (~16 000 points), et
+au-delà **ferme la connexion sans erreur applicative**, ce qui fait boucler le client.
+D'où `SCAN3D_MAX_BATCH_MB` (32 Mo) et des lots de ~4000 points côté app.
+
+**Le relais marche en WebSocket mais pas en long-polling.** Si le trafic LAN ressort et
+rentre par la box (hairpin NAT), le long-polling se dégrade (le GET en attente est clos
+par un ping au lieu des données) alors que le WebSocket passe. L'app privilégie donc
+`['websocket', 'polling']`.
+
+**Le compteur « envoyé » reste à 0 en mode binaire.** L'ack `count` est calculé sur un
+tableau JSON ; un lot binaire doit être compté via l'en-tête `uint32`.
+
+---
+
+## Application Android
+
+La capture (ARCore Depth → nuage coloré, envoi par lots, affichage AR) est un projet
+Kotlin distinct : **[scan3d-android](https://github.com/escolar35-JE/scan3d-android)**.
+Elle permet de saisir l'URL du serveur et le token, et gère les deux formats d'envoi.
+
+---
+
+## Structure du dépôt
+
+```
+server.js                 relais Express + socket.io
+auth.js                   gate token (HTTP + handshake), CORS
+index.html                viewer three.js (voxels)
+tools/e2e.js              test de bout en bout
+deploy/                   m29.conf, scan3d.service, snippets Caddy, .env.example
+```
+
+---
+
+## Licence & crédits
+
+Fork de [Oursel06/scan3d](https://github.com/Oursel06/scan3d) ; se référer au dépôt amont
+pour les conditions d'utilisation. Rendu 3D via [three.js](https://threejs.org/),
+temps réel via [Socket.IO](https://socket.io/).
