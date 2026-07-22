@@ -32,12 +32,14 @@
   <div id="app"></div>
   <div id="hud">
     <span id="dot"></span> <span id="state">Connexion…</span> &nbsp;|&nbsp; Blocs : <b id="count">0</b><br>
-    Étendue (L×H×P) : <b id="dims">— × — × —</b>
+    Étendue (L×H×P) : <b id="dims">— × — × —</b><br>
+    <span id="navhint">Appuie sur <b>F</b> pour te balader (1re personne)</span>
   </div>
 
   <script type="module">
     import * as THREE from 'three';
     import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+    import { PointerLockControls } from 'three/addons/controls/PointerLockControls.js';
 
     // Token d'acces : ?k=... dans l'URL, sinon le cookie pose par le serveur
     // au premier chargement (permet un F5 sans remettre ?k=).
@@ -53,6 +55,8 @@
     // Seuil d'occupation : un voxel n'est affiché qu'après avoir été vu >= MIN_HITS fois.
     // Filtre le bruit de profondeur (voxels parasites vus une seule fois). ?minhits=1 pour tout afficher.
     const MIN_HITS = Math.max(1, parseInt(new URLSearchParams(location.search).get('minhits'), 10) || 2);
+    // Anti-flotteurs : masque les voxels ayant moins de MIN_NEIGH voisins occupés (0 = désactivé).
+    const MIN_NEIGH = Math.max(0, parseInt(new URLSearchParams(location.search).get('minneigh'), 10) || 1);
     let capacity = 300000;
 
     // ---- Scene / Camera / Renderer -------------------------------------
@@ -70,6 +74,40 @@
 
     const controls = new OrbitControls(camera, renderer.domElement);
     controls.enableDamping = true;
+
+    // --- Navigation 1re personne (se balader dans la scène, façon Minecraft) ---
+    const navHint = document.getElementById('navhint');
+    const fps = new PointerLockControls(camera, renderer.domElement);
+    const keys = Object.create(null);
+    const clock = new THREE.Clock();
+    let flySpeed = 3.0; // m/s (molette pour ajuster)
+    addEventListener('keydown', (e) => { keys[e.code] = true; });
+    addEventListener('keyup',   (e) => { keys[e.code] = false; });
+    fps.addEventListener('lock', () => {
+      controls.enabled = false;
+      navHint.innerHTML = '<b>ZQSD</b> déplacer · <b>Espace/Ctrl</b> monter/descendre · <b>Maj</b> vite · molette vitesse · <b>Échap</b> quitter';
+    });
+    fps.addEventListener('unlock', () => {
+      controls.enabled = true;
+      const fwd = new THREE.Vector3(); camera.getWorldDirection(fwd);
+      controls.target.copy(camera.position).addScaledVector(fwd, 2); // orbite cohérente après le vol
+      navHint.innerHTML = 'Appuie sur <b>F</b> pour te balader (1re personne)';
+    });
+    addEventListener('wheel', (e) => {
+      if (fps.isLocked) { flySpeed = Math.max(0.3, Math.min(30, flySpeed * (e.deltaY < 0 ? 1.15 : 0.87))); e.preventDefault(); }
+    }, { passive: false });
+    function updateFly() {
+      const dt = clock.getDelta();
+      if (!fps.isLocked) return;
+      const boost = (keys['ShiftLeft'] || keys['ShiftRight']) ? 3 : 1;
+      const v = flySpeed * boost * dt;
+      if (keys['KeyW'] || keys['ArrowUp'])    fps.moveForward(v);
+      if (keys['KeyS'] || keys['ArrowDown'])  fps.moveForward(-v);
+      if (keys['KeyD'] || keys['ArrowRight']) fps.moveRight(v);
+      if (keys['KeyA'] || keys['ArrowLeft'])  fps.moveRight(-v);
+      if (keys['Space'])       camera.position.y += v;
+      if (keys['ControlLeft']) camera.position.y -= v;
+    }
 
     // Eclairage doux (ciel/sol) + directionnels : volume et lisibilité des faces.
     scene.add(new THREE.HemisphereLight(0xffffff, 0x404050, 0.9));
@@ -143,7 +181,7 @@
     // Recalcule couleur (moyenne × AO) et visibilité (masquage si 6 voisins) d'un voxel.
     // Masqué aussi tant que le voxel n'a pas atteint le seuil d'occupation (anti-bruit).
     function updateAppearance(idx) {
-      const visible = neigh[idx] < 6 && cnt[idx] >= MIN_HITS;
+      const visible = neigh[idx] < 6 && cnt[idx] >= MIN_HITS && neigh[idx] >= MIN_NEIGH;
       dummy.position.set((vIx[idx] + 0.5) * VOXEL, (vIy[idx] + 0.5) * VOXEL, (vIz[idx] + 0.5) * VOXEL);
       dummy.rotation.set(0, 0, 0);
       dummy.scale.setScalar(visible ? 1 : 0.0001); // interne -> dégénéré (invisible)
@@ -251,6 +289,8 @@
     }
     addEventListener('keydown', (e) => {
       const k = e.key.toLowerCase();
+      if (k === 'f') { fps.isLocked ? fps.unlock() : fps.lock(); return; } // bascule 1re personne
+      if (fps.isLocked) return;                                            // en vol : pas de r/c accidentel
       if (k === 'r') fitToScene();
       else if (k === 'c') clearScene();
     });
@@ -273,7 +313,8 @@
     renderer.setAnimationLoop(() => {
       if (matrixDirty) { mesh.instanceMatrix.needsUpdate = true; matrixDirty = false; }
       if (colorDirty && mesh.instanceColor) { mesh.instanceColor.needsUpdate = true; colorDirty = false; }
-      controls.update();
+      updateFly();
+      if (controls.enabled) controls.update(); // orbite seulement hors 1re personne
       renderer.render(scene, camera);
     });
   </script>
