@@ -31,7 +31,8 @@
 <body>
   <div id="app"></div>
   <div id="hud">
-    <span id="dot"></span> <span id="state">Connexion…</span> &nbsp;|&nbsp; Blocs : <b id="count">0</b>
+    <span id="dot"></span> <span id="state">Connexion…</span> &nbsp;|&nbsp; Blocs : <b id="count">0</b><br>
+    Étendue (L×H×P) : <b id="dims">— × — × —</b>
   </div>
 
   <script type="module">
@@ -49,6 +50,9 @@
     // Taille de bloc : 5 cm par défaut, ajustable via ?voxel=0.03 (3 cm) dans l'URL.
     const VOXEL = parseFloat(new URLSearchParams(location.search).get('voxel')) || 0.05;
     const INV_VOXEL = 1 / VOXEL;
+    // Seuil d'occupation : un voxel n'est affiché qu'après avoir été vu >= MIN_HITS fois.
+    // Filtre le bruit de profondeur (voxels parasites vus une seule fois). ?minhits=1 pour tout afficher.
+    const MIN_HITS = Math.max(1, parseInt(new URLSearchParams(location.search).get('minhits'), 10) || 2);
     let capacity = 300000;
 
     // ---- Scene / Camera / Renderer -------------------------------------
@@ -104,6 +108,17 @@
     const dummy = new THREE.Object3D();
     const tmpColor = new THREE.Color();
     const countEl = document.getElementById('count');
+    const dimsEl = document.getElementById('dims');
+
+    // Étendue réelle du nuage capté (en mètres). La bbox stocke les CENTRES de voxels,
+    // donc l'étendue physique vaut (max - min) + VOXEL. Sert à diagnostiquer un scan "aplati".
+    function updateDims() {
+      if (occupied === 0 || !Number.isFinite(bboxMin.x)) { dimsEl.textContent = '— × — × —'; return; }
+      const w = bboxMax.x - bboxMin.x + VOXEL;
+      const h = bboxMax.y - bboxMin.y + VOXEL;
+      const d = bboxMax.z - bboxMin.z + VOXEL;
+      dimsEl.textContent = `${w.toFixed(2)} × ${h.toFixed(2)} × ${d.toFixed(2)} m`;
+    }
 
     const NB = [[1,0,0],[-1,0,0],[0,1,0],[0,-1,0],[0,0,1],[0,0,-1]];
 
@@ -126,8 +141,9 @@
     }
 
     // Recalcule couleur (moyenne × AO) et visibilité (masquage si 6 voisins) d'un voxel.
+    // Masqué aussi tant que le voxel n'a pas atteint le seuil d'occupation (anti-bruit).
     function updateAppearance(idx) {
-      const visible = neigh[idx] < 6;
+      const visible = neigh[idx] < 6 && cnt[idx] >= MIN_HITS;
       dummy.position.set((vIx[idx] + 0.5) * VOXEL, (vIy[idx] + 0.5) * VOXEL, (vIz[idx] + 0.5) * VOXEL);
       dummy.rotation.set(0, 0, 0);
       dummy.scale.setScalar(visible ? 1 : 0.0001); // interne -> dégénéré (invisible)
@@ -207,6 +223,7 @@
       else if (ArrayBuffer.isView(data)) addBinary(data.buffer);
       else addJson(data);
       countEl.textContent = occupied;
+      updateDims();
       if (!fitted && occupied > 0) { fitToScene(); fitted = true; }
     });
 
@@ -230,7 +247,7 @@
       if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
       neigh.fill(0); cnt.fill(0);
       bboxMin.set(Infinity, Infinity, Infinity); bboxMax.set(-Infinity, -Infinity, -Infinity);
-      fitted = false; countEl.textContent = 0;
+      fitted = false; countEl.textContent = 0; updateDims();
     }
     addEventListener('keydown', (e) => {
       const k = e.key.toLowerCase();

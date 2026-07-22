@@ -7,16 +7,19 @@ const auth = require('./auth');
 const app = express();
 const server = http.createServer(app);
 
-// Taille max d'un lot de points. Le defaut socket.io est de 1 Mo seulement, soit
-// ~16 000 points : au-dela le serveur FERME la connexion sans message d'erreur,
-// et le client boucle en reconnexion. 400 000 points ~= 26 Mo.
-const MAX_BATCH_MB = Number(process.env.SCAN3D_MAX_BATCH_MB || 32);
+// Taille max d'un lot de points. socket.io plafonne a 1 Mo par defaut, soit
+// ~16 000 points : au-dela le serveur FERME la connexion sans erreur applicative
+// et le client boucle en reconnexion (symptome : l'app reste sur "connexion...",
+// aucun point n'arrive). 400 000 points ~= 26 Mo.
+// SCAN3D_MAX_BATCH_MB est le nom courant ; MAX_BATCH_MB reste accepte pour
+// compatibilite avec la variable introduite en amont.
+const MAX_BATCH_MB = Number(process.env.SCAN3D_MAX_BATCH_MB || process.env.MAX_BATCH_MB || 32);
 
 // CORS restreint aux origines de SCAN3D_ORIGINS. Sans effet sur l'app Android :
 // un client natif n'envoie pas d'en-tete Origin.
 const io = new Server(server, {
   cors: { origin: auth.corsOrigin },
-  maxHttpBufferSize: MAX_BATCH_MB * 1024 * 1024,
+  maxHttpBufferSize: MAX_BATCH_MB * 1024 * 1024
 });
 
 const PORT = process.env.PORT || 3000;
